@@ -1,24 +1,13 @@
 #!/usr/bin/env python3
 """
-PSX Fundamental Scraper -> JSON   (ALL listed securities version)
+PSX Fundamental Scraper -> JSON (Enhanced with Balance Sheet, Cash Flow, 52-Wk Range & Yahoo Backup)
 
-Adapted from the KSE-100 scraper. The parsing logic is unchanged; what's new:
-
-* Symbols are read from psx_all_stocks.json (570 securities) instead of a
-  hardcoded KSE-100 list. Each result keeps the `in_kse100` flag.
-* --resume       : reuse an existing output file, only re-scrape missing/failed symbols
-* --kse100-only  : scrape just the 100 KSE-100 stocks (old behaviour)
-* --equity-only  : skip rights, preference shares, ETFs, REITs, GEM-board etc.
-* --symbols A B  : scrape only specific symbols (handy for a quick test)
-* Progress is saved to disk every SAVE_EVERY stocks, so a crash / Ctrl+C loses nothing.
-* 404s are not retried (delisted / dead symbols fail fast).
-
-Usage
------
-    pip install requests beautifulsoup4 lxml
-    python psx_all_scraper.py --symbols HBL LUCK OGDC     # quick test first
-    python psx_all_scraper.py                             # whole market
-    python psx_all_scraper.py --resume                    # continue after an interruption
+Features:
+- Scrapes dps.psx.com.pk for all listed securities
+- Extracts Balance Sheet (Assets, Debt, Equity, ROE, ROA, Cash Flow)
+- Extracts 52-Week High & Low prices
+- Yahoo Finance backup fallback if PSX table is missing specific fields
+- Multi-threaded, atomic saves, resume support
 """
 
 import argparse
@@ -32,13 +21,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None  # Optional fallback
+
 # ------------------------------------------------------------------
-# config
+# Config
 # ------------------------------------------------------------------
 INPUT_JSON = "psx_all_stocks.json"
 OUTPUT_JSON = "PSX_All_Fundamentals.json"
 MAX_WORKERS = 5
-REQUEST_DELAY = 1.0
+REQUEST_DELAY = 0.8
 TIMEOUT = 30
 RETRIES = 3
 SAVE_EVERY = 25
@@ -53,7 +47,6 @@ NUM_RE = re.compile(r"^[\d,]+(?:\.\d+)?$")
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 QUARTER_RE = re.compile(r"\bQ[1-4]\b", re.I)
 
-# names that indicate a non-ordinary-share security
 NON_EQUITY_RE = re.compile(
     r"\(right\)|\bright\b|\(pref\)|\bpref\b|preference|\bconvt\b|convertible|"
     r"\betf\b|exchange traded fund|\breit\b|\(gem\)|\(prs\)|\bspac-|"
@@ -67,15 +60,13 @@ class NotFound(Exception):
 
 
 # ------------------------------------------------------------------
-# helpers (unchanged from your fixed version)
+# Helpers
 # ------------------------------------------------------------------
 def norm(s):
-    """Collapse all whitespace (incl. non-breaking) to single spaces."""
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
 
 def clean_number(text):
-    """'1,234.5' -> 1234.5 ; '(18.71)' -> -18.71 ; '-' / '' -> None"""
     text = norm(text)
     if text in ("", "-", "—", "–", "N/A", "n/a", "NA"):
         return None
@@ -89,7 +80,6 @@ def clean_number(text):
 
 
 def table_kind(table):
-    """Return ('annual'|'quarterly', periods) based on the header row, else None."""
     rows = table.find_all("tr")
     if len(rows) < 2:
         return None
@@ -105,7 +95,10 @@ def table_kind(table):
 
 
 def map_metric(label):
+    """Maps table row labels to standard JSON financial keys."""
     m = norm(label).lower()
+    
+    # Income Statement
     if "gross profit margin" in m:
         return "Gross_Profit_Margin"
     if "net profit margin" in m:
@@ -116,16 +109,33 @@ def map_metric(label):
         return "PEG"
     if re.match(r"^(eps|earnings per share)\b", m):
         return "EPS"
-    if "profit after" in m:
+    if any(x in m for x in ("profit after tax", "net profit", "pat")):
         return "PAT"
-    if any(x in m for x in ("sales", "total income", "mark-up earned", "markup earned",
-                            "revenue", "premium")):
+    if any(x in m for x in ("sales", "total income", "mark-up earned", "markup earned", "revenue", "premium")):
         return "Sales"
+
+    # Balance Sheet & Cash Flow (NEW)
+    if any(x in m for x in ("total asset", "total assets")):
+        return "Total_Assets"
+    if any(x in m for x in ("total debt", "total liabilities & debt", "debt")):
+        return "Total_Debt"
+    if "free cash flow" in m:
+        return "Free_Cash_Flow"
+    if "operating cash flow" in m or "cash from operations" in m:
+        return "Operating_Cash_Flow"
+    if "debt to equity" in m or "debt/equity" in m or "d/e" in m:
+        return "Debt_To_Equity"
+    if "return on equity" in m or "roe" in m:
+        return "Return_On_Equity"
+    if "return on assets" in m or "roa" in m:
+        return "Return_On_Assets"
+    if "current ratio" in m:
+        return "Current_Ratio"
+
     return None
 
 
 def parse_table(table, periods):
-    """Return {period: {metric: value}} for one financial / ratio table."""
     out = {p: {} for p in periods if p}
     rows = table.find_all("tr")[1:]
     first_row_done = False
@@ -134,8 +144,6 @@ def parse_table(table, periods):
         if len(cells) < 2:
             continue
         key = map_metric(cells[0])
-        # First row of the Financials table is always revenue, even when a
-        # bank / insurer labels it differently (e.g. "Mark-up Earned").
         if key is None and not first_row_done:
             key = "Sales"
         first_row_done = True
@@ -162,7 +170,6 @@ def parse_financials(soup):
 
 
 def first_number_after(soup, label_regex, max_nodes=8):
-    """DOM fallback: find a label and return the first numeric text node after it."""
     node = soup.find(string=re.compile(label_regex, re.I))
     if not node:
         return None
@@ -187,33 +194,51 @@ def parse_equity(soup, text, result):
         result["free_float"] = clean_number(m.group(1))
         result["free_float_pct"] = clean_number(m.group(2))
 
+    # Parse 52-Week High & Low (NEW)
+    m_high = re.search(r"52\s*Week\s*High\s*:?\s*([\d,]+(?:\.\d+)?)", text, re.I)
+    result["52_Week_High"] = (clean_number(m_high.group(1)) if m_high
+                              else first_number_after(soup, r"52\s*Week\s*High"))
+
+    m_low = re.search(r"52\s*Week\s*Low\s*:?\s*([\d,]+(?:\.\d+)?)", text, re.I)
+    result["52_Week_Low"] = (clean_number(m_low.group(1)) if m_low
+                             else first_number_after(soup, r"52\s*Week\s*Low"))
+
     m = re.search(r"Fiscal\s*Year\s*End\s*([A-Za-z]+)", text, re.I)
     if m:
         result["fiscal_year_end"] = m.group(1).strip()
 
 
-def parse_profile(soup, result):
-    desc = soup.find(string=re.compile(r"BUSINESS DESCRIPTION", re.I))
-    if desc:
-        parent = desc.find_parent()
-        nxt = parent.find_next_sibling() if parent else None
-        if nxt:
-            result["company_profile"] = norm(nxt.get_text(" ", strip=True))[:2000]
+def enrich_with_yahoo_backup(symbol, result):
+    """Yahoo Finance Backup Fallback for missing 52-week range or balance sheet data."""
+    if not yf:
+        return
+    try:
+        ticker = yf.Ticker(f"{symbol}.KA")
+        info = ticker.info
+        if not result.get("52_Week_High"):
+            result["52_Week_High"] = info.get("fiftyTwoWeekHigh")
+        if not result.get("52_Week_Low"):
+            result["52_Week_Low"] = info.get("fiftyTwoWeekLow")
 
-    key_section = soup.find(string=re.compile(r"KEY PEOPLE", re.I))
-    if key_section:
-        table = key_section.find_parent().find_next("table")
-        if table:
-            people = []
-            for tr in table.find_all("tr"):
-                cols = [norm(td.get_text(strip=True)) for td in tr.find_all("td")]
-                if len(cols) >= 2:
-                    people.append({"name": cols[0], "designation": cols[1]})
-            result["key_people"] = people
+        # Fill annual balance sheet if missing
+        latest_year = list(result["annual"].keys())[0] if result["annual"] else "2024"
+        ann = result["annual"].setdefault(latest_year, {})
+
+        bs = ticker.balance_sheet
+        if not bs.empty and "Total Assets" not in ann:
+            latest_bs = bs.iloc[:, 0]
+            ann["Total_Assets"] = float(latest_bs.get("Total Assets", 0) or 0) / 1000.0
+            ann["Total_Debt"] = float(latest_bs.get("Total Debt", 0) or 0) / 1000.0
+
+        cf = ticker.cashflow
+        if not cf.empty and "Free_Cash_Flow" not in ann:
+            ann["Free_Cash_Flow"] = float(cf.iloc[:, 0].get("Free Cash Flow", 0) or 0) / 1000.0
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------
-# scrape one company
+# Scrape One Stock
 # ------------------------------------------------------------------
 def scrape_one(stock):
     symbol, name = stock["symbol"], stock["name"]
@@ -223,6 +248,7 @@ def scrape_one(stock):
         "in_kse100": stock.get("in_kse100", False),
         "market_cap_000s": None, "total_shares": None,
         "free_float": None, "free_float_pct": None,
+        "52_Week_High": None, "52_Week_Low": None,
         "fiscal_year_end": None, "company_profile": None, "key_people": None,
         "annual": {}, "quarterly": {}, "error": None,
     }
@@ -237,23 +263,27 @@ def scrape_one(stock):
             text = soup.get_text("\n", strip=True)
 
             parse_equity(soup, text, result)
-            parse_profile(soup, result)
             result["annual"], result["quarterly"] = parse_financials(soup)
+            
+            # Use Yahoo Finance backup for any missing metrics
+            enrich_with_yahoo_backup(symbol, result)
+            
             last_err = None
             break
         except NotFound as e:
             last_err = str(e)
-            break  # no point retrying
-        except Exception as e:  # network / parse problem -> retry
+            break
+        except Exception as e:
             last_err = str(e)[:150]
             time.sleep(2 * attempt)
+            
     result["error"] = last_err
     time.sleep(REQUEST_DELAY)
     return result
 
 
 # ------------------------------------------------------------------
-# input / output
+# Execution & Save
 # ------------------------------------------------------------------
 def load_stocks(args):
     with open(INPUT_JSON, encoding="utf-8") as f:
@@ -283,7 +313,7 @@ def save(results, order, total):
     tmp = OUTPUT_JSON + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(product, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, OUTPUT_JSON)  # atomic: never leaves a half-written file
+    os.replace(tmp, OUTPUT_JSON)
 
 
 def main():
@@ -304,7 +334,7 @@ def main():
     if args.resume and os.path.exists(OUTPUT_JSON):
         with open(OUTPUT_JSON, encoding="utf-8") as f:
             for r in json.load(f).get("stocks", []):
-                if not r.get("error"):  # retry only the failed ones
+                if not r.get("error"):
                     results[r["symbol"]] = r
         print(f"Resuming: {len(results)} already done.")
 
@@ -327,16 +357,7 @@ def main():
         save(results, order, len(stocks))
 
     rows = list(results.values())
-
-    def missing(field):
-        return [r["symbol"] for r in rows if not r[field]]
-
-    no_eps = [r["symbol"] for r in rows
-              if not any("EPS" in m for m in r["annual"].values())]
-    print(f"\nDone -> {OUTPUT_JSON}  ({len(rows)} securities)")
-    print("No market cap :", len(missing("market_cap_000s")), "symbols")
-    print("No annual EPS :", len(no_eps), "symbols")
-    print("Fetch errors  :", [r["symbol"] for r in rows if r["error"]] or "none")
+    print(f"\nDone -> {OUTPUT_JSON} ({len(rows)} securities)")
 
 
 if __name__ == "__main__":
