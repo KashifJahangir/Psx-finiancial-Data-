@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-PSX Fundamental Scraper -> JSON (Enhanced with Balance Sheet, Cash Flow, 52-Wk Range & Yahoo Backup)
+PSX Fundamental Scraper -> JSON
 
-Features:
-- Scrapes dps.psx.com.pk for all listed securities
-- Extracts Balance Sheet (Assets, Debt, Equity, ROE, ROA, Cash Flow)
-- Extracts 52-Week High & Low prices
-- Yahoo Finance backup fallback if PSX table is missing specific fields
-- Multi-threaded, atomic saves, resume support
+Per company it collects:
+  * PSX (dps.psx.com.pk): market cap, shares, free float, 52-week range,
+    fiscal year end, business description, key people, annual/quarterly
+    Sales / PAT / EPS / ratios
+  * stockanalysis.com (fallback: Yahoo Finance): full balance sheet,
+    cash flow statement and income statement (annual, values in millions PKR)
+
+NOTE: dps.psx.com.pk does NOT publish balance sheet / cash flow tables,
+so those come from a second source.
+
+Usage:
+  python psx_scraper.py --symbols AABS          # test one stock first
+  python psx_scraper.py --resume
+  python psx_scraper.py --no-statements         # PSX page only (fast)
 """
 
 import argparse
@@ -24,7 +32,7 @@ from bs4 import BeautifulSoup
 try:
     import yfinance as yf
 except ImportError:
-    yf = None  # Optional fallback
+    yf = None
 
 # ------------------------------------------------------------------
 # Config
@@ -43,6 +51,12 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+STATEMENT_PAGES = {
+    "balance_sheet": "balance-sheet",
+    "cash_flow": "cash-flow-statement",
+    "income_statement": "",  # base /financials/ page
+}
+
 NUM_RE = re.compile(r"^[\d,]+(?:\.\d+)?$")
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 QUARTER_RE = re.compile(r"\bQ[1-4]\b", re.I)
@@ -56,7 +70,7 @@ NON_EQUITY_RE = re.compile(
 
 
 class NotFound(Exception):
-    """Raised on HTTP 404 so we don't waste retries."""
+    pass
 
 
 # ------------------------------------------------------------------
@@ -67,16 +81,22 @@ def norm(s):
 
 
 def clean_number(text):
-    text = norm(text)
-    if text in ("", "-", "—", "–", "N/A", "n/a", "NA"):
+    text = norm(str(text) if text is not None else "")
+    if text in ("", "-", "—", "–", "N/A", "n/a", "NA", "Upgrade"):
         return None
-    neg = text.startswith("(") and text.endswith(")")
-    text = text.replace(",", "").replace("(", "").replace(")", "").replace("%", "").strip()
+    neg = (text.startswith("(") and text.endswith(")")) or text.startswith("-")
+    text = (text.replace(",", "").replace("(", "").replace(")", "")
+            .replace("%", "").replace("-", "").strip())
     try:
         val = float(text)
     except ValueError:
         return None
     return -val if neg else val
+
+
+def snake(label):
+    s = re.sub(r"[^A-Za-z0-9]+", "_", norm(label)).strip("_")
+    return s
 
 
 def table_kind(table):
@@ -95,10 +115,7 @@ def table_kind(table):
 
 
 def map_metric(label):
-    """Maps table row labels to standard JSON financial keys."""
     m = norm(label).lower()
-    
-    # Income Statement
     if "gross profit margin" in m:
         return "Gross_Profit_Margin"
     if "net profit margin" in m:
@@ -111,27 +128,9 @@ def map_metric(label):
         return "EPS"
     if any(x in m for x in ("profit after tax", "net profit", "pat")):
         return "PAT"
-    if any(x in m for x in ("sales", "total income", "mark-up earned", "markup earned", "revenue", "premium")):
+    if any(x in m for x in ("sales", "total income", "mark-up earned",
+                            "markup earned", "revenue", "premium")):
         return "Sales"
-
-    # Balance Sheet & Cash Flow (NEW)
-    if any(x in m for x in ("total asset", "total assets")):
-        return "Total_Assets"
-    if any(x in m for x in ("total debt", "total liabilities & debt", "debt")):
-        return "Total_Debt"
-    if "free cash flow" in m:
-        return "Free_Cash_Flow"
-    if "operating cash flow" in m or "cash from operations" in m:
-        return "Operating_Cash_Flow"
-    if "debt to equity" in m or "debt/equity" in m or "d/e" in m:
-        return "Debt_To_Equity"
-    if "return on equity" in m or "roe" in m:
-        return "Return_On_Equity"
-    if "return on assets" in m or "roa" in m:
-        return "Return_On_Assets"
-    if "current ratio" in m:
-        return "Current_Ratio"
-
     return None
 
 
@@ -180,6 +179,9 @@ def first_number_after(soup, label_regex, max_nodes=8):
     return None
 
 
+# ------------------------------------------------------------------
+# PSX page: equity info, 52-week range, profile, key people
+# ------------------------------------------------------------------
 def parse_equity(soup, text, result):
     m = re.search(r"Market\s*Cap\s*\(\s*000.{0,3}\)\s*([\d,]+(?:\.\d+)?)", text, re.I)
     result["market_cap_000s"] = (clean_number(m.group(1)) if m
@@ -194,53 +196,134 @@ def parse_equity(soup, text, result):
         result["free_float"] = clean_number(m.group(1))
         result["free_float_pct"] = clean_number(m.group(2))
 
-    # Parse 52-Week High & Low (NEW)
-    m_high = re.search(r"52\s*Week\s*High\s*:?\s*([\d,]+(?:\.\d+)?)", text, re.I)
-    result["52_Week_High"] = (clean_number(m_high.group(1)) if m_high
-                              else first_number_after(soup, r"52\s*Week\s*High"))
-
-    m_low = re.search(r"52\s*Week\s*Low\s*:?\s*([\d,]+(?:\.\d+)?)", text, re.I)
-    result["52_Week_Low"] = (clean_number(m_low.group(1)) if m_low
-                             else first_number_after(soup, r"52\s*Week\s*Low"))
+    # 52-week range: PSX shows "52-WEEK RANGE  low  —  high"
+    m = re.search(
+        r"52[\s-]*WEEK\s*RANGE\D{0,15}?([\d,]+(?:\.\d+)?)\D{1,15}?([\d,]+(?:\.\d+)?)",
+        text, re.I)
+    if m:
+        lo, hi = clean_number(m.group(1)), clean_number(m.group(2))
+        if lo is not None and hi is not None:
+            result["52_Week_Low"], result["52_Week_High"] = min(lo, hi), max(lo, hi)
 
     m = re.search(r"Fiscal\s*Year\s*End\s*([A-Za-z]+)", text, re.I)
     if m:
         result["fiscal_year_end"] = m.group(1).strip()
 
 
-def enrich_with_yahoo_backup(symbol, result):
-    """Yahoo Finance Backup Fallback for missing 52-week range or balance sheet data."""
+def parse_profile(soup, text, result):
+    m = re.search(r"BUSINESS\s*DESCRIPTION\s*(.*?)\s*KEY\s*PEOPLE", text, re.S | re.I)
+    if m:
+        desc = norm(m.group(1))
+        result["company_profile"] = desc or None
+
+    node = soup.find(string=re.compile(r"^\s*KEY\s*PEOPLE\s*$", re.I))
+    if node:
+        tbl = node.find_next("table")
+        people = []
+        if tbl:
+            for row in tbl.find_all("tr"):
+                cells = [norm(c.get_text(" ", strip=True)) for c in row.find_all(["th", "td"])]
+                if len(cells) >= 2 and cells[0].lower() not in ("name", ""):
+                    people.append({"name": cells[0], "position": cells[1]})
+        result["key_people"] = people or None
+
+
+# ------------------------------------------------------------------
+# Balance sheet / cash flow / income statement
+# ------------------------------------------------------------------
+def fetch_statement_stockanalysis(symbol, page):
+    """Returns {period: {metric: value}} (annual, millions PKR) or {}."""
+    base = f"https://stockanalysis.com/quote/psx/{symbol}/financials/"
+    url = base + (page + "/" if page else "")
+    resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    if resp.status_code != 200:
+        return {}
+    soup = BeautifulSoup(resp.text, "lxml")
+    tbl = soup.find("table")
+    if not tbl:
+        return {}
+    rows = tbl.find_all("tr")
+    if len(rows) < 3:
+        return {}
+    header = [norm(c.get_text(" ", strip=True)) for c in rows[0].find_all(["th", "td"])]
+    periods = header[1:]
+    out = {p: {} for p in periods if p}
+    for row in rows[1:]:
+        cells = [norm(c.get_text(" ", strip=True)) for c in row.find_all(["th", "td"])]
+        if len(cells) < 2:
+            continue
+        key = snake(cells[0])
+        if not key:
+            continue
+        for i, p in enumerate(periods):
+            if p and i + 1 < len(cells):
+                raw = cells[i + 1]
+                # keep period-end dates as text, everything else numeric
+                out[p][key] = raw if key.lower().startswith("period") else clean_number(raw)
+    return out
+
+
+def fetch_statements_yahoo(symbol):
+    """Fallback via yfinance. Raw PKR -> millions PKR."""
     if not yf:
-        return
+        return {}
+    out = {}
     try:
-        ticker = yf.Ticker(f"{symbol}.KA")
-        info = ticker.info
-        if not result.get("52_Week_High"):
-            result["52_Week_High"] = info.get("fiftyTwoWeekHigh")
-        if not result.get("52_Week_Low"):
-            result["52_Week_Low"] = info.get("fiftyTwoWeekLow")
-
-        # Fill annual balance sheet if missing
-        latest_year = list(result["annual"].keys())[0] if result["annual"] else "2024"
-        ann = result["annual"].setdefault(latest_year, {})
-
-        bs = ticker.balance_sheet
-        if not bs.empty and "Total Assets" not in ann:
-            latest_bs = bs.iloc[:, 0]
-            ann["Total_Assets"] = float(latest_bs.get("Total Assets", 0) or 0) / 1000.0
-            ann["Total_Debt"] = float(latest_bs.get("Total Debt", 0) or 0) / 1000.0
-
-        cf = ticker.cashflow
-        if not cf.empty and "Free_Cash_Flow" not in ann:
-            ann["Free_Cash_Flow"] = float(cf.iloc[:, 0].get("Free Cash Flow", 0) or 0) / 1000.0
+        t = yf.Ticker(f"{symbol}.KA")
+        for key, df in (("balance_sheet", t.balance_sheet),
+                        ("cash_flow", t.cashflow),
+                        ("income_statement", t.financials)):
+            if df is None or df.empty:
+                continue
+            d = {}
+            for col in df.columns:
+                year = str(col.year)
+                d[year] = {}
+                for label, val in df[col].items():
+                    try:
+                        d[year][snake(label)] = None if val != val else float(val) / 1e6
+                    except (TypeError, ValueError):
+                        d[year][snake(label)] = None
+            out[key] = d
     except Exception:
         pass
+    return out
+
+
+def enrich_statements(symbol, result):
+    for key, page in STATEMENT_PAGES.items():
+        data = {}
+        try:
+            data = fetch_statement_stockanalysis(symbol, page)
+        except Exception:
+            pass
+        result[key] = data
+        time.sleep(0.4)
+
+    # fallback for anything still empty
+    if not all(result.get(k) for k in STATEMENT_PAGES):
+        yb = fetch_statements_yahoo(symbol)
+        for k in STATEMENT_PAGES:
+            if not result.get(k) and yb.get(k):
+                result[k] = yb[k]
+                result.setdefault("statement_source", {})[k] = "yahoo"
+
+    # 52-week fallback from Yahoo
+    if yf and (result.get("52_Week_High") is None or result.get("52_Week_Low") is None):
+        try:
+            info = yf.Ticker(f"{symbol}.KA").info
+            if result.get("52_Week_High") is None:
+                result["52_Week_High"] = info.get("fiftyTwoWeekHigh")
+            if result.get("52_Week_Low") is None:
+                result["52_Week_Low"] = info.get("fiftyTwoWeekLow")
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------
-# Scrape One Stock
+# Scrape one stock
 # ------------------------------------------------------------------
-def scrape_one(stock):
+def scrape_one(stock, with_statements=True):
     symbol, name = stock["symbol"], stock["name"]
     url = f"https://dps.psx.com.pk/company/{symbol}"
     result = {
@@ -250,7 +333,9 @@ def scrape_one(stock):
         "free_float": None, "free_float_pct": None,
         "52_Week_High": None, "52_Week_Low": None,
         "fiscal_year_end": None, "company_profile": None, "key_people": None,
-        "annual": {}, "quarterly": {}, "error": None,
+        "annual": {}, "quarterly": {},
+        "balance_sheet": {}, "cash_flow": {}, "income_statement": {},
+        "error": None,
     }
     last_err = None
     for attempt in range(1, RETRIES + 1):
@@ -263,11 +348,12 @@ def scrape_one(stock):
             text = soup.get_text("\n", strip=True)
 
             parse_equity(soup, text, result)
+            parse_profile(soup, text, result)
             result["annual"], result["quarterly"] = parse_financials(soup)
-            
-            # Use Yahoo Finance backup for any missing metrics
-            enrich_with_yahoo_backup(symbol, result)
-            
+
+            if with_statements:
+                enrich_statements(symbol, result)
+
             last_err = None
             break
         except NotFound as e:
@@ -276,19 +362,18 @@ def scrape_one(stock):
         except Exception as e:
             last_err = str(e)[:150]
             time.sleep(2 * attempt)
-            
+
     result["error"] = last_err
     time.sleep(REQUEST_DELAY)
     return result
 
 
 # ------------------------------------------------------------------
-# Execution & Save
+# Execution & save
 # ------------------------------------------------------------------
 def load_stocks(args):
     with open(INPUT_JSON, encoding="utf-8") as f:
         stocks = json.load(f)["stocks"]
-
     if args.kse100_only:
         stocks = [s for s in stocks if s.get("in_kse100")]
     if args.equity_only:
@@ -304,7 +389,7 @@ def save(results, order, total):
     results_sorted = sorted(results.values(), key=lambda x: order.get(x["symbol"], 99999))
     product = {
         "index": "PSX-ALL",
-        "source": "PSX Data Portal (dps.psx.com.pk)",
+        "source": "PSX Data Portal (dps.psx.com.pk) + stockanalysis.com / Yahoo Finance",
         "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(results_sorted),
         "target_count": total,
@@ -318,9 +403,11 @@ def save(results, order, total):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--resume", action="store_true", help="skip symbols already scraped OK")
+    ap.add_argument("--resume", action="store_true")
     ap.add_argument("--kse100-only", action="store_true")
     ap.add_argument("--equity-only", action="store_true")
+    ap.add_argument("--no-statements", action="store_true",
+                    help="skip balance sheet / cash flow / income statement")
     ap.add_argument("--symbols", nargs="+")
     args = ap.parse_args()
 
@@ -343,7 +430,7 @@ def main():
 
     try:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = {ex.submit(scrape_one, s): s for s in todo}
+            futures = {ex.submit(scrape_one, s, not args.no_statements): s for s in todo}
             for i, fut in enumerate(as_completed(futures), 1):
                 res = fut.result()
                 results[res["symbol"]] = res
@@ -356,8 +443,7 @@ def main():
     finally:
         save(results, order, len(stocks))
 
-    rows = list(results.values())
-    print(f"\nDone -> {OUTPUT_JSON} ({len(rows)} securities)")
+    print(f"\nDone -> {OUTPUT_JSON} ({len(results)} securities)")
 
 
 if __name__ == "__main__":
