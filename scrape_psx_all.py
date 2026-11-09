@@ -229,6 +229,141 @@ def parse_profile(soup, text, result):
 
 
 # ------------------------------------------------------------------
+# Dividends: DPS, Dividend_Yield, Payout_Ratio (per fiscal year)
+# ------------------------------------------------------------------
+# NOTE: the Payouts table on the PSX company page is loaded by JavaScript,
+# so it is EMPTY in the HTML that requests downloads. We call the same
+# endpoint the page's JavaScript calls. If PSX changes it, find the new URL
+# in your browser: open the company page -> F12 -> Network -> Fetch/XHR ->
+# reload -> click the request that returns the payouts table, then put its
+# URL / method / form fields into PAYOUT_ENDPOINTS below.
+PAYOUT_ENDPOINTS = [
+    # (method, url, form-field name that carries the symbol)
+    ("POST", "https://dps.psx.com.pk/company/payouts", "symbol"),
+    ("POST", "https://dps.psx.com.pk/payouts", "symbol"),
+]
+
+PAYOUT_RE = re.compile(r"([\d,]+(?:\.\d+)?)\s*%\s*((?:\(\s*[A-Za-z]+\s*\)\s*)+)")
+PERIOD_RE = re.compile(r"\d{1,2}/\d{1,2}/(?:19|20)\d{2}\s*\([^)]*\)")   # 31/03/2024(IIIQ)
+DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/((?:19|20)\d{2})")
+MONTHS = {m: i for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june", "july",
+     "august", "september", "october", "november", "december"], 1)}
+
+
+def fetch_payouts_soup(symbol):
+    """Calls PSX's payouts endpoint like the page's JavaScript does.
+    Returns (soup_or_None, debug_text)."""
+    company_url = f"https://dps.psx.com.pk/company/{symbol}"
+    hdrs = {**HEADERS,
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "text/html, */*; q=0.01",
+            "Origin": "https://dps.psx.com.pk",
+            "Referer": company_url}
+    debug = []
+    sess = requests.Session()
+    try:
+        sess.get(company_url, headers=HEADERS, timeout=TIMEOUT)  # pick up cookies
+    except Exception as ex:
+        debug.append(f"session GET failed: {str(ex)[:80]}")
+    for method, url, field in PAYOUT_ENDPOINTS:
+        try:
+            if method == "POST":
+                r = sess.post(url, data={field: symbol}, headers=hdrs, timeout=TIMEOUT)
+            else:
+                r = sess.get(url, params={field: symbol}, headers=hdrs, timeout=TIMEOUT)
+            debug.append(f"{method} {url} -> {r.status_code}, {len(r.text)} bytes")
+            if r.status_code == 200 and "<tr" in r.text.lower():
+                return BeautifulSoup(r.text, "lxml"), "; ".join(debug)
+        except Exception as ex:
+            debug.append(f"{method} {url} error: {str(ex)[:80]}")
+    return None, "; ".join(debug)
+
+
+def extract_payout_rows(soup):
+    """Content-based: a payout row has a 'dd/mm/yyyy(IIIQ)' cell and a '25%(iii) (D)' cell."""
+    rows = []
+    for tr in soup.find_all("tr"):
+        cells = [norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+        period = next((c for c in cells if PERIOD_RE.search(c)), None)
+        details = next((c for c in cells if PAYOUT_RE.search(c) or re.search(r"\([DBR]\)", c)), None)
+        if period and details and period != details:
+            rows.append((cells[0], PERIOD_RE.search(period).group(0), details))
+    return rows
+
+
+def fiscal_year_of(period, fye_month):
+    """Period end date -> fiscal year label (matches PSX annual columns)."""
+    m = DATE_RE.search(period)
+    if not m:
+        return None
+    month, year = int(m.group(2)), int(m.group(3))
+    if fye_month and month > fye_month:
+        year += 1          # e.g. June FY: 31/12/2025 belongs to FY2026
+    return str(year)
+
+
+def parse_payouts(soup, text, result, symbol):
+    """
+    DPS per fiscal year = sum of all cash (D) payouts for that year, where
+    percent is of face value (Rs 10 unless the page states otherwise).
+    (B) bonus and (R) right issues are ignored.
+    """
+    m = re.search(r"Face\s*Value\s*:?\s*(?:Rs\.?\s*)?([\d.]+)", text, re.I)
+    face_value = clean_number(m.group(1)) if m and clean_number(m.group(1)) else 10.0
+    fye_month = MONTHS.get((result.get("fiscal_year_end") or "").lower())
+
+    source = "static"
+    raw_rows = extract_payout_rows(soup)
+    if not raw_rows:
+        ajax, dbg = fetch_payouts_soup(symbol)
+        raw_rows = extract_payout_rows(ajax) if ajax else []
+        source = "ajax" if raw_rows else None
+        result["payouts_debug"] = dbg + f"; rows parsed: {len(raw_rows)}"
+
+    payouts = []
+    for announced, period, details in raw_rows:
+        cash_pct = 0.0
+        for pm in PAYOUT_RE.finditer(details):
+            tags = re.findall(r"\(\s*([A-Za-z]+)\s*\)", pm.group(2))
+            if any(t.upper() == "D" for t in tags):
+                cash_pct += clean_number(pm.group(1)) or 0.0
+        payouts.append({
+            "announced": announced,
+            "period": period,
+            "details": details,
+            "fiscal_year": fiscal_year_of(period, fye_month),
+            "cash_dividend_pct": cash_pct,
+            "DPS": round(cash_pct / 100.0 * face_value, 4),
+        })
+
+    result["payouts"] = payouts
+    result["payouts_source"] = source
+
+    dps_by_year = {}
+    for p in payouts:
+        if p["fiscal_year"]:
+            dps_by_year[p["fiscal_year"]] = dps_by_year.get(p["fiscal_year"], 0.0) + p["DPS"]
+
+    price = None
+    if result.get("market_cap_000s") and result.get("total_shares"):
+        price = result["market_cap_000s"] * 1000.0 / result["total_shares"]
+    result["current_price_implied"] = round(price, 2) if price else None
+
+    for y in sorted(set(result["annual"]) | set(dps_by_year)):
+        ann = result["annual"].setdefault(y, {})
+        dps = round(dps_by_year.get(y, 0.0), 4)
+        eps = ann.get("EPS")
+        ann["DPS"] = dps
+        # yield is against the CURRENT price (PSX page has no historical prices)
+        ann["Dividend_Yield"] = round(dps / price * 100.0, 2) if price else None
+        if eps is not None and eps > 0:
+            ann["Payout_Ratio"] = round(dps / eps * 100.0, 2)
+        else:
+            ann["Payout_Ratio"] = 0.0 if (dps == 0 and eps is not None) else None
+
+
+# ------------------------------------------------------------------
 # Balance sheet / cash flow / income statement
 # ------------------------------------------------------------------
 def fetch_statement_stockanalysis(symbol, page):
@@ -334,6 +469,7 @@ def scrape_one(stock, with_statements=True):
         "52_Week_High": None, "52_Week_Low": None,
         "fiscal_year_end": None, "company_profile": None, "key_people": None,
         "annual": {}, "quarterly": {},
+        "payouts": [], "payouts_source": None, "current_price_implied": None,
         "balance_sheet": {}, "cash_flow": {}, "income_statement": {},
         "error": None,
     }
@@ -350,6 +486,7 @@ def scrape_one(stock, with_statements=True):
             parse_equity(soup, text, result)
             parse_profile(soup, text, result)
             result["annual"], result["quarterly"] = parse_financials(soup)
+            parse_payouts(soup, text, result, symbol)
 
             if with_statements:
                 enrich_statements(symbol, result)
