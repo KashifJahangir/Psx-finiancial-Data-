@@ -5,17 +5,15 @@ PSX Fundamental Scraper -> JSON
 Per company it collects:
   * PSX (dps.psx.com.pk): market cap, shares, free float, 52-week range,
     fiscal year end, business description, key people, annual/quarterly
-    Sales / PAT / EPS / ratios
+    Sales / PAT / EPS / ratios / payouts
   * stockanalysis.com (fallback: Yahoo Finance): full balance sheet,
-    cash flow statement and income statement (annual, values in millions PKR)
-
-NOTE: dps.psx.com.pk does NOT publish balance sheet / cash flow tables,
-so those come from a second source.
+    cash flow statement, income statement (annual, values in millions PKR),
+    and dividend history/summary when PSX does not provide payout data.
 
 Usage:
-  python psx_scraper.py --symbols AABS          # test one stock first
+  python psx_scraper.py --symbols HUBC          # test one stock first
   python psx_scraper.py --resume
-  python psx_scraper.py --no-statements         # PSX page only (fast)
+  python psx_scraper.py --no-statements         # skip financial statements (fast)
 """
 
 import argparse
@@ -23,8 +21,10 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -68,6 +68,15 @@ NON_EQUITY_RE = re.compile(
     re.I,
 )
 
+DATE_FORMATS = (
+    "%b %d, %Y", "%B %d, %Y", "%Y-%m-%d",
+    "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d %B %Y",
+)
+
+DIV_PAIR_RE = re.compile(r"([\d,]+(?:\.\d+)?)\s*\(\s*([\d,]+(?:\.\d+)?)\s*%\s*\)")
+
+_thread_local = threading.local()
+
 
 class NotFound(Exception):
     pass
@@ -76,13 +85,39 @@ class NotFound(Exception):
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+def get_session():
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        _thread_local.session = s
+    return _thread_local.session
+
+
+def fetch_with_retries(method, url, **kwargs):
+    sess = get_session()
+    kwargs.setdefault("timeout", TIMEOUT)
+    for attempt in range(1, RETRIES + 1):
+        try:
+            resp = sess.request(method, url, **kwargs)
+            if resp.status_code == 429:
+                retry_after = float(resp.headers.get("Retry-After", 2 * attempt))
+                time.sleep(min(retry_after, 10))
+                continue
+            return resp
+        except requests.RequestException:
+            if attempt == RETRIES:
+                raise
+            time.sleep(1.5 * attempt)
+    return None
+
+
 def norm(s):
     return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
 
 def clean_number(text):
     text = norm(str(text) if text is not None else "")
-    if text in ("", "-", "—", "–", "N/A", "n/a", "NA", "Upgrade"):
+    if text.lower() in ("", "-", "—", "–", "n/a", "na", "none", "upgrade"):
         return None
     neg = (text.startswith("(") and text.endswith(")")) or text.startswith("-")
     text = (text.replace(",", "").replace("(", "").replace(")", "")
@@ -94,9 +129,39 @@ def clean_number(text):
     return -val if neg else val
 
 
+def clean_currency_number(text):
+    text = norm(str(text) if text is not None else "")
+    if not text or text.lower() in ("-", "—", "–", "n/a", "na", "none", "upgrade"):
+        return None
+    cleaned = re.sub(r"\b(?:PKR|Rs|USD)\b\.?|₨|\$|,", "", text, flags=re.I).strip()
+    m = re.search(r"^\(?\s*(-?\d+(?:\.\d+)?)\s*\)?", cleaned)
+    if not m:
+        m = re.search(r"(-?\d+(?:\.\d+)?)", cleaned)
+        if not m:
+            return None
+        return float(m.group(1))
+    val = float(m.group(1))
+    neg = cleaned.startswith("-") or (cleaned.startswith("(") and ")" in cleaned)
+    return -abs(val) if neg else val
+
+
+def parse_date_flexible(text):
+    t = norm(text)
+    if not t or t.lower() in ("-", "—", "–", "n/a", "na", "none"):
+        return None
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+    m = YEAR_RE.search(t)
+    if m:
+        return datetime(int(m.group(0)), 1, 1)
+    return None
+
+
 def snake(label):
-    s = re.sub(r"[^A-Za-z0-9]+", "_", norm(label)).strip("_")
-    return s
+    return re.sub(r"[^A-Za-z0-9]+", "_", norm(label)).strip("_")
 
 
 def table_kind(table):
@@ -229,39 +294,42 @@ def parse_profile(soup, text, result):
 
 
 # ------------------------------------------------------------------
-# Dividends: DPS, Dividend_Yield, Payout_Ratio (per fiscal year)
+# Dividends: PSX + stockanalysis.com fallback + Yahoo Finance fallback
 # ------------------------------------------------------------------
-# NOTE: the Payouts table on the PSX company page is loaded by JavaScript,
-# so it is EMPTY in the HTML that requests downloads. We call the same
-# endpoint the page's JavaScript calls. If PSX changes it, find the new URL
-# in your browser: open the company page -> F12 -> Network -> Fetch/XHR ->
-# reload -> click the request that returns the payouts table, then put its
-# URL / method / form fields into PAYOUT_ENDPOINTS below.
 PAYOUT_ENDPOINTS = [
-    # (method, url, form-field name that carries the symbol)
     ("POST", "https://dps.psx.com.pk/company/payouts", "symbol"),
+    ("GET",  "https://dps.psx.com.pk/company/payouts", "symbol"),
+    ("GET",  "https://dps.psx.com.pk/company/payouts/{symbol}", None),
     ("POST", "https://dps.psx.com.pk/payouts", "symbol"),
+    ("GET",  "https://dps.psx.com.pk/payouts", "symbol"),
 ]
 
-PAYOUT_RE = re.compile(r"([\d,]+(?:\.\d+)?)\s*%\s*((?:\(\s*[A-Za-z]+\s*\)\s*)+)")
-PERIOD_RE = re.compile(r"\d{1,2}/\d{1,2}/(?:19|20)\d{2}\s*\([^)]*\)")   # 31/03/2024(IIIQ)
-DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/((?:19|20)\d{2})")
+PAYOUT_RE = re.compile(
+    r"([\d,]+(?:\.\d+)?)\s*%\s*((?:[,;/\-\s]*\(\s*[A-Za-z]+\s*\)\s*)+)"
+)
+PERIOD_RE = re.compile(r"\d{1,2}[/-]\d{1,2}[/-](?:19|20)\d{2}(?:\s*\([^)]*\))?")
+DATE_RE = re.compile(r"(\d{1,2})[/-](\d{1,2})[/-]((?:19|20)\d{2})")
 MONTHS = {m: i for i, m in enumerate(
     ["january", "february", "march", "april", "may", "june", "july",
      "august", "september", "october", "november", "december"], 1)}
 
 
 def fetch_payouts_soup(symbol):
-    """Calls PSX's payouts endpoint (what the page's JavaScript does)."""
-    hdrs = {**HEADERS, "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"https://dps.psx.com.pk/company/{symbol}"}
-    for method, url, field in PAYOUT_ENDPOINTS:
+    """Calls PSX's payouts endpoint using the active session."""
+    hdrs = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://dps.psx.com.pk/company/{symbol}",
+    }
+    for method, url_tmpl, field in PAYOUT_ENDPOINTS:
+        url = url_tmpl.format(symbol=symbol)
         try:
             if method == "POST":
-                r = requests.post(url, data={field: symbol}, headers=hdrs, timeout=TIMEOUT)
+                r = fetch_with_retries("POST", url, data={field: symbol}, headers=hdrs)
+            elif field:
+                r = fetch_with_retries("GET", url, params={field: symbol}, headers=hdrs)
             else:
-                r = requests.get(url, params={field: symbol}, headers=hdrs, timeout=TIMEOUT)
-            if r.status_code == 200 and "<tr" in r.text.lower():
+                r = fetch_with_retries("GET", url, headers=hdrs)
+            if r and r.status_code == 200 and "<tr" in r.text.lower():
                 return BeautifulSoup(r.text, "lxml")
         except Exception:
             continue
@@ -269,12 +337,19 @@ def fetch_payouts_soup(symbol):
 
 
 def extract_payout_rows(soup):
-    """Content-based: a payout row has a 'dd/mm/yyyy(IIIQ)' cell and a '25%(iii) (D)' cell."""
+    """Content-based: a payout row has a date/period cell and a payout %/(D)(B)(R) cell."""
+    if not soup:
+        return []
     rows = []
     for tr in soup.find_all("tr"):
         cells = [norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+        if len(cells) < 2:
+            continue
         period = next((c for c in cells if PERIOD_RE.search(c)), None)
-        details = next((c for c in cells if PAYOUT_RE.search(c) or re.search(r"\([DBR]\)", c)), None)
+        details = next(
+            (c for c in cells if PAYOUT_RE.search(c) or re.search(r"\([DBR]\)", c, re.I)),
+            None,
+        )
         if period and details and period != details:
             rows.append((cells[0], PERIOD_RE.search(period).group(0), details))
     return rows
@@ -287,15 +362,246 @@ def fiscal_year_of(period, fye_month):
         return None
     month, year = int(m.group(2)), int(m.group(3))
     if fye_month and month > fye_month:
-        year += 1          # e.g. June FY: 31/12/2025 belongs to FY2026
+        year += 1  # e.g. June FY: 31/12/2025 belongs to FY2026
     return str(year)
+
+
+def _extract_sa_kv_pairs(soup):
+    """Extracts label -> raw value text from StockAnalysis tables and summary blocks."""
+    kv = {}
+    for tr in soup.find_all("tr"):
+        cells = [norm(c.get_text(" ", strip=True)) for c in tr.find_all(["th", "td"])]
+        if len(cells) == 2 and cells[0]:
+            kv.setdefault(cells[0].lower(), cells[1])
+
+    summary_labels = (
+        "Dividend Yield",
+        "Annual Dividend",
+        "Ex-Dividend Date",
+        "Payout Frequency",
+        "Payout Ratio",
+        "Dividend Growth",
+        "Dividend",
+        "Previous Close",
+        "52-Week Range",
+    )
+    label_set = {x.lower() for x in summary_labels}
+    for label in summary_labels:
+        key = label.lower()
+        if key in kv:
+            continue
+        node = soup.find(string=re.compile(rf"^\s*{re.escape(label)}\s*$", re.I))
+        if not node:
+            continue
+        for nxt in node.find_all_next(string=True, limit=4):
+            t = norm(nxt)
+            if not t:
+                continue
+            if t.lower() in label_set:
+                break
+            kv[key] = t
+            break
+    return kv
+
+
+def parse_stockanalysis_overview(symbol):
+    """Scrapes summary dividend & quote info from https://stockanalysis.com/quote/psx/{symbol}/."""
+    url = f"https://stockanalysis.com/quote/psx/{symbol.upper()}/"
+    try:
+        resp = fetch_with_retries("GET", url)
+    except Exception:
+        return {}
+    if not resp or resp.status_code != 200:
+        return {}
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    kv = _extract_sa_kv_pairs(soup)
+    summary = {}
+
+    div_raw = kv.get("dividend")
+    if div_raw:
+        m = DIV_PAIR_RE.search(div_raw)
+        if m:
+            summary["annual_dividend"] = clean_number(m.group(1))
+            summary["dividend_yield_pct"] = clean_number(m.group(2))
+        else:
+            summary["annual_dividend"] = clean_currency_number(div_raw)
+
+    if summary.get("dividend_yield_pct") is None and kv.get("dividend yield"):
+        summary["dividend_yield_pct"] = clean_number(kv["dividend yield"])
+
+    if kv.get("ex-dividend date") and kv["ex-dividend date"].lower() not in ("n/a", "-", "—"):
+        summary["ex_dividend_date"] = kv["ex-dividend date"]
+
+    if kv.get("payout ratio"):
+        summary["payout_ratio_pct"] = clean_number(kv["payout ratio"])
+
+    if kv.get("previous close"):
+        summary["previous_close"] = clean_currency_number(kv["previous close"])
+
+    if kv.get("52-week range"):
+        m = re.search(r"([\d,]+(?:\.\d+)?)\s*[-–—]\s*([\d,]+(?:\.\d+)?)", kv["52-week range"])
+        if m:
+            lo, hi = clean_number(m.group(1)), clean_number(m.group(2))
+            if lo is not None and hi is not None:
+                summary["52_Week_Low"] = min(lo, hi)
+                summary["52_Week_High"] = max(lo, hi)
+
+    return summary
+
+
+def parse_stockanalysis_dividend_page(symbol):
+    """Scrapes summary + dividend history table from .../quote/psx/{symbol}/dividend/."""
+    url = f"https://stockanalysis.com/quote/psx/{symbol.upper()}/dividend/"
+    try:
+        resp = fetch_with_retries("GET", url)
+    except Exception:
+        return {}, []
+    if not resp or resp.status_code != 200:
+        return {}, []
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    kv = _extract_sa_kv_pairs(soup)
+    summary = {}
+
+    if kv.get("annual dividend"):
+        summary["annual_dividend"] = clean_currency_number(kv["annual dividend"])
+    if kv.get("dividend yield"):
+        summary["dividend_yield_pct"] = clean_number(kv["dividend yield"])
+    if kv.get("ex-dividend date") and kv["ex-dividend date"].lower() not in ("n/a", "-", "—"):
+        summary["ex_dividend_date"] = kv["ex-dividend date"]
+    if kv.get("payout frequency") and kv["payout frequency"].lower() not in ("n/a", "-", "—"):
+        summary["payout_frequency"] = kv["payout frequency"]
+    if kv.get("payout ratio"):
+        summary["payout_ratio_pct"] = clean_number(kv["payout ratio"])
+    if kv.get("dividend growth"):
+        summary["dividend_growth_pct"] = clean_number(kv["dividend growth"])
+
+    payouts = []
+    for tbl in soup.find_all("table"):
+        rows = tbl.find_all("tr")
+        if len(rows) < 2:
+            continue
+        headers = [norm(c.get_text(" ", strip=True)).lower()
+                   for c in rows[0].find_all(["th", "td"])]
+        ex_idx = next((i for i, h in enumerate(headers)
+                       if "ex-dividend" in h or "ex date" in h), None)
+        amt_idx = next((i for i, h in enumerate(headers)
+                        if "cash amount" in h or "amount" in h or h == "dividend"), None)
+        if ex_idx is None or amt_idx is None:
+            continue
+
+        rec_idx = next((i for i, h in enumerate(headers) if "record" in h), None)
+        pay_idx = next((i for i, h in enumerate(headers) if "pay" in h), None)
+        type_idx = next((i for i, h in enumerate(headers) if "type" in h), None)
+
+        for row in rows[1:]:
+            cells = [norm(c.get_text(" ", strip=True)) for c in row.find_all(["th", "td"])]
+            if max(ex_idx, amt_idx) >= len(cells):
+                continue
+            dps = clean_currency_number(cells[amt_idx])
+            if dps is None:
+                continue
+            ex_date_str = cells[ex_idx]
+            dt = parse_date_flexible(ex_date_str)
+            rec_date = cells[rec_idx] if rec_idx is not None and rec_idx < len(cells) else None
+            pay_date = cells[pay_idx] if pay_idx is not None and pay_idx < len(cells) else None
+            div_type = cells[type_idx] if type_idx is not None and type_idx < len(cells) else "Cash"
+            payouts.append({
+                "announced": None,
+                "ex_dividend_date": ex_date_str,
+                "record_date": None if not rec_date or rec_date in ("-", "—", "n/a") else rec_date,
+                "pay_date": None if not pay_date or pay_date in ("-", "—", "n/a") else pay_date,
+                "period": ex_date_str,
+                "details": f"PKR {dps} ({div_type or 'Cash'})",
+                "fiscal_year": str(dt.year) if dt else None,
+                "cash_dividend_pct": None,
+                "DPS": round(dps, 4),
+            })
+        if payouts:
+            break
+
+    return summary, payouts
+
+
+def fetch_dividend_stockanalysis(symbol):
+    """
+    Checks StockAnalysis /dividend/ first for full history, then /quote/psx/{symbol}/
+    to fill missing summary metrics, price, or overview-only dividend info.
+    """
+    summary, payouts = parse_stockanalysis_dividend_page(symbol)
+    need_overview = (
+        not payouts
+        or summary.get("annual_dividend") is None
+        or summary.get("dividend_yield_pct") is None
+        or summary.get("ex_dividend_date") is None
+    )
+    if need_overview:
+        ov = parse_stockanalysis_overview(symbol)
+        for k, v in ov.items():
+            if summary.get(k) is None and v is not None:
+                summary[k] = v
+
+    summary = {k: v for k, v in summary.items() if v is not None}
+    if payouts:
+        summary["source"] = "stockanalysis"
+        return payouts, summary, "stockanalysis"
+    if any(k in summary for k in ("annual_dividend", "dividend_yield_pct", "ex_dividend_date")):
+        summary["source"] = "stockanalysis_overview"
+        return [], summary, "stockanalysis_overview"
+    return [], summary, None
+
+
+def fetch_dividends_yahoo(symbol):
+    """Last-resort dividend fallback via yfinance."""
+    if not yf:
+        return [], {}, None
+    try:
+        t = yf.Ticker(f"{symbol}.KA")
+        divs = t.dividends
+        payouts = []
+        if divs is not None and not divs.empty:
+            for dt, val in divs.items():
+                if val is None or val != val:
+                    continue
+                date_str = dt.strftime("%Y-%m-%d")
+                dps = round(float(val), 4)
+                payouts.append({
+                    "announced": None,
+                    "ex_dividend_date": date_str,
+                    "period": date_str,
+                    "details": f"PKR {dps} (Yahoo)",
+                    "fiscal_year": str(dt.year),
+                    "cash_dividend_pct": None,
+                    "DPS": dps,
+                })
+        summary = {}
+        try:
+            info = t.info or {}
+            if info.get("dividendRate") is not None:
+                summary["annual_dividend"] = round(float(info["dividendRate"]), 4)
+            if info.get("dividendYield") is not None:
+                y = float(info["dividendYield"])
+                summary["dividend_yield_pct"] = round(y * 100 if y < 1 else y, 2)
+            if info.get("payoutRatio") is not None:
+                summary["payout_ratio_pct"] = round(float(info["payoutRatio"]) * 100, 2)
+        except Exception:
+            pass
+        if payouts:
+            summary["source"] = "yahoo"
+            return payouts, summary, "yahoo"
+        if summary:
+            summary["source"] = "yahoo_overview"
+            return [], summary, "yahoo_overview"
+    except Exception:
+        pass
+    return [], {}, None
 
 
 def parse_payouts(soup, text, result, symbol):
     """
-    DPS per fiscal year = sum of all cash (D) payouts for that year, where
-    percent is of face value (Rs 10 unless the page states otherwise).
-    (B) bonus and (R) right issues are ignored.
+    Collects dividends from PSX first. If PSX returns no payout rows,
+    falls back to stockanalysis.com (/dividend/ and overview page) and then Yahoo Finance.
     """
     m = re.search(r"Face\s*Value\s*:?\s*(?:Rs\.?\s*)?([\d.]+)", text, re.I)
     face_value = clean_number(m.group(1)) if m and clean_number(m.group(1)) else 10.0
@@ -309,45 +615,80 @@ def parse_payouts(soup, text, result, symbol):
         source = "ajax" if raw_rows else None
 
     payouts = []
-    for announced, period, details in raw_rows:
-        cash_pct = 0.0
-        for pm in PAYOUT_RE.finditer(details):
-            tags = re.findall(r"\(\s*([A-Za-z]+)\s*\)", pm.group(2))
-            if any(t.upper() == "D" for t in tags):
-                cash_pct += clean_number(pm.group(1)) or 0.0
-        payouts.append({
-            "announced": announced,
-            "period": period,
-            "details": details,
-            "fiscal_year": fiscal_year_of(period, fye_month),
-            "cash_dividend_pct": cash_pct,
-            "DPS": round(cash_pct / 100.0 * face_value, 4),
-        })
+    if raw_rows:
+        for announced, period, details in raw_rows:
+            cash_pct = 0.0
+            for pm in PAYOUT_RE.finditer(details):
+                tags = re.findall(r"\(\s*([A-Za-z]+)\s*\)", pm.group(2))
+                if any(t.upper() == "D" for t in tags):
+                    cash_pct += clean_number(pm.group(1)) or 0.0
+            payouts.append({
+                "announced": announced,
+                "period": period,
+                "details": details,
+                "fiscal_year": fiscal_year_of(period, fye_month),
+                "cash_dividend_pct": cash_pct,
+                "DPS": round(cash_pct / 100.0 * face_value, 4),
+            })
+        sa_summary = {}
+    else:
+        payouts, sa_summary, source = fetch_dividend_stockanalysis(symbol)
+        # Fill 52-week range from StockAnalysis overview if PSX missed it
+        if result.get("52_Week_Low") is None and sa_summary.get("52_Week_Low") is not None:
+            result["52_Week_Low"] = sa_summary.pop("52_Week_Low")
+        else:
+            sa_summary.pop("52_Week_Low", None)
+        if result.get("52_Week_High") is None and sa_summary.get("52_Week_High") is not None:
+            result["52_Week_High"] = sa_summary.pop("52_Week_High")
+        else:
+            sa_summary.pop("52_Week_High", None)
+
+        if not payouts and source is None:
+            payouts, y_summary, source = fetch_dividends_yahoo(symbol)
+            sa_summary.update(y_summary)
 
     result["payouts"] = payouts
     result["payouts_source"] = source
+    result["dividend_summary"] = sa_summary or None
 
     dps_by_year = {}
     for p in payouts:
-        if p["fiscal_year"]:
-            dps_by_year[p["fiscal_year"]] = dps_by_year.get(p["fiscal_year"], 0.0) + p["DPS"]
+        if p.get("fiscal_year"):
+            fy = p["fiscal_year"]
+            dps_by_year[fy] = dps_by_year.get(fy, 0.0) + (p.get("DPS") or 0.0)
 
     price = None
     if result.get("market_cap_000s") and result.get("total_shares"):
         price = result["market_cap_000s"] * 1000.0 / result["total_shares"]
+    elif sa_summary.get("previous_close"):
+        price = sa_summary["previous_close"]
+    elif sa_summary.get("annual_dividend") and sa_summary.get("dividend_yield_pct"):
+        if sa_summary["dividend_yield_pct"] > 0:
+            price = sa_summary["annual_dividend"] / (sa_summary["dividend_yield_pct"] / 100.0)
     result["current_price_implied"] = round(price, 2) if price else None
+
+    min_hist_year = min((int(y) for y in dps_by_year if y.isdigit()), default=None)
 
     for y in sorted(set(result["annual"]) | set(dps_by_year)):
         ann = result["annual"].setdefault(y, {})
-        dps = round(dps_by_year.get(y, 0.0), 4)
         eps = ann.get("EPS")
-        ann["DPS"] = dps
-        # yield is against the CURRENT price (PSX page has no historical prices)
-        ann["Dividend_Yield"] = round(dps / price * 100.0, 2) if price else None
-        if eps is not None and eps > 0:
-            ann["Payout_Ratio"] = round(dps / eps * 100.0, 2)
+
+        if source in ("static", "ajax"):
+            dps = round(dps_by_year.get(y, 0.0), 4)
+        elif source in ("stockanalysis", "yahoo") and dps_by_year:
+            in_window = min_hist_year is not None and y.isdigit() and int(y) >= min_hist_year
+            dps = round(dps_by_year.get(y, 0.0), 4) if (y in dps_by_year or in_window) else None
         else:
-            ann["Payout_Ratio"] = 0.0 if (dps == 0 and eps is not None) else None
+            dps = None
+
+        ann["DPS"] = dps
+        ann["Dividend_Yield"] = round(dps / price * 100.0, 2) if (dps is not None and price) else None
+        if dps is not None and eps is not None and eps > 0:
+            ann["Payout_Ratio"] = round(dps / eps * 100.0, 2)
+        elif dps == 0 and eps is not None:
+            ann["Payout_Ratio"] = 0.0
+        else:
+            ann["Payout_Ratio"] = None
 
 
 # ------------------------------------------------------------------
@@ -355,10 +696,10 @@ def parse_payouts(soup, text, result, symbol):
 # ------------------------------------------------------------------
 def fetch_statement_stockanalysis(symbol, page):
     """Returns {period: {metric: value}} (annual, millions PKR) or {}."""
-    base = f"https://stockanalysis.com/quote/psx/{symbol}/financials/"
+    base = f"https://stockanalysis.com/quote/psx/{symbol.upper()}/financials/"
     url = base + (page + "/" if page else "")
-    resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    if resp.status_code != 200:
+    resp = fetch_with_retries("GET", url)
+    if not resp or resp.status_code != 200:
         return {}
     soup = BeautifulSoup(resp.text, "lxml")
     tbl = soup.find("table")
@@ -380,7 +721,6 @@ def fetch_statement_stockanalysis(symbol, page):
         for i, p in enumerate(periods):
             if p and i + 1 < len(cells):
                 raw = cells[i + 1]
-                # keep period-end dates as text, everything else numeric
                 out[p][key] = raw if key.lower().startswith("period") else clean_number(raw)
     return out
 
@@ -456,14 +796,15 @@ def scrape_one(stock, with_statements=True):
         "52_Week_High": None, "52_Week_Low": None,
         "fiscal_year_end": None, "company_profile": None, "key_people": None,
         "annual": {}, "quarterly": {},
-        "payouts": [], "payouts_source": None, "current_price_implied": None,
+        "payouts": [], "payouts_source": None, "dividend_summary": None,
+        "current_price_implied": None,
         "balance_sheet": {}, "cash_flow": {}, "income_statement": {},
         "error": None,
     }
     last_err = None
     for attempt in range(1, RETRIES + 1):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            resp = fetch_with_retries("GET", url)
             if resp.status_code == 404:
                 raise NotFound("HTTP 404")
             resp.raise_for_status()
