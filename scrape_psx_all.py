@@ -229,6 +229,81 @@ def parse_profile(soup, text, result):
 
 
 # ------------------------------------------------------------------
+# Dividends: DPS, Dividend_Yield, Payout_Ratio (per fiscal year)
+# ------------------------------------------------------------------
+PAYOUT_RE = re.compile(r"([\d,]+(?:\.\d+)?)\s*%\s*((?:\(\s*[A-Za-z]+\s*\)\s*)+)")
+
+
+def parse_payouts(soup, text, result):
+    """
+    Reads the PSX 'Payouts' table (Date | Financial Results | Details | Book Closure).
+    Details look like '25% (D)' / '100% (i) (D)' / '10% (B)'.
+      (D) = cash dividend, (B) = bonus shares, (R) = right shares -> only (D) counts.
+    Percent is of face value (Rs 10 unless the page says otherwise).
+    Adds per-year DPS, Dividend_Yield, Payout_Ratio into result['annual'].
+    """
+    m = re.search(r"Face\s*Value\s*:?\s*(?:Rs\.?\s*)?([\d.]+)", text, re.I)
+    face_value = clean_number(m.group(1)) if m and clean_number(m.group(1)) else 10.0
+
+    payouts = []
+    for tbl in soup.find_all("table"):
+        rows = tbl.find_all("tr")
+        if len(rows) < 2:
+            continue
+        header = [norm(c.get_text(" ", strip=True)).lower()
+                  for c in rows[0].find_all(["th", "td"])]
+        if not (any("detail" in h for h in header) and any("result" in h for h in header)):
+            continue
+        ri = next(i for i, h in enumerate(header) if "result" in h)
+        di = next(i for i, h in enumerate(header) if "detail" in h)
+        for row in rows[1:]:
+            cells = [norm(c.get_text(" ", strip=True)) for c in row.find_all(["th", "td"])]
+            if len(cells) <= max(ri, di):
+                continue
+            period, details = cells[ri], cells[di]
+            ym = YEAR_RE.search(period)
+            cash_pct = 0.0
+            for pm in PAYOUT_RE.finditer(details):
+                tags = re.findall(r"\(\s*([A-Za-z]+)\s*\)", pm.group(2))
+                if any(t.upper() == "D" for t in tags):
+                    cash_pct += clean_number(pm.group(1)) or 0.0
+            payouts.append({
+                "date": cells[0],
+                "period": period,
+                "details": details,
+                "year": ym.group(0) if ym else None,
+                "cash_dividend_pct": cash_pct,
+                "DPS": round(cash_pct / 100.0 * face_value, 4),
+            })
+        break  # first matching table is the payouts table
+
+    result["payouts"] = payouts
+
+    dps_by_year = {}
+    for p in payouts:
+        if p["year"]:
+            dps_by_year[p["year"]] = dps_by_year.get(p["year"], 0.0) + p["DPS"]
+
+    # current price = market cap (000s) * 1000 / shares
+    price = None
+    if result.get("market_cap_000s") and result.get("total_shares"):
+        price = result["market_cap_000s"] * 1000.0 / result["total_shares"]
+    result["current_price_implied"] = round(price, 2) if price else None
+
+    years = set(result["annual"].keys()) | set(dps_by_year.keys())
+    for y in sorted(years):
+        ann = result["annual"].setdefault(y, {})
+        dps = round(dps_by_year.get(y, 0.0), 4)
+        eps = ann.get("EPS")
+        ann["DPS"] = dps
+        # yield uses the CURRENT price (no historical price available on PSX page)
+        ann["Dividend_Yield"] = round(dps / price * 100.0, 2) if price else None
+        ann["Payout_Ratio"] = (round(dps / eps * 100.0, 2)
+                               if eps not in (None, 0) and eps > 0 else
+                               (0.0 if dps == 0 and eps is not None else None))
+
+
+# ------------------------------------------------------------------
 # Balance sheet / cash flow / income statement
 # ------------------------------------------------------------------
 def fetch_statement_stockanalysis(symbol, page):
@@ -334,6 +409,7 @@ def scrape_one(stock, with_statements=True):
         "52_Week_High": None, "52_Week_Low": None,
         "fiscal_year_end": None, "company_profile": None, "key_people": None,
         "annual": {}, "quarterly": {},
+        "payouts": [], "current_price_implied": None,
         "balance_sheet": {}, "cash_flow": {}, "income_statement": {},
         "error": None,
     }
@@ -350,6 +426,7 @@ def scrape_one(stock, with_statements=True):
             parse_equity(soup, text, result)
             parse_profile(soup, text, result)
             result["annual"], result["quarterly"] = parse_financials(soup)
+            parse_payouts(soup, text, result)
 
             if with_statements:
                 enrich_statements(symbol, result)
