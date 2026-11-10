@@ -43,9 +43,9 @@ except ImportError:
 # ------------------------------------------------------------------
 INPUT_JSON = "psx_all_stocks.json"
 OUTPUT_JSON = "PSX_All_Fundamentals.json"
-MAX_WORKERS = 3            # stockanalysis rate-limits; keep this low
+MAX_WORKERS = 2            # stockanalysis rate-limits; keep this low
 REQUEST_DELAY = 0.8
-SA_DELAY = 0.6             # pause between stockanalysis requests
+SA_DELAY = 1.2             # pause between stockanalysis requests
 TIMEOUT = 30
 RETRIES = 3
 SAVE_EVERY = 25
@@ -268,12 +268,18 @@ def parse_profile(soup, text, result):
 # ------------------------------------------------------------------
 # stockanalysis.com helpers
 # ------------------------------------------------------------------
+SA_RETRIES = 6
+
+
 def sa_get(session, url, log=None):
-    """GET a stockanalysis page -> BeautifulSoup or None. Every attempt is
-    recorded in `log` so you can see WHY a section is empty."""
-    for attempt in range(1, RETRIES + 1):
+    """GET a stockanalysis page -> BeautifulSoup or None. 404 = page really
+    does not exist (fine). Anything else that never succeeds is logged as
+    BLOCKED so the stock is marked incomplete and re-scraped on --resume."""
+    last = None
+    for attempt in range(1, SA_RETRIES + 1):
         try:
             r = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+            last = r.status_code
             if log is not None:
                 log.append(f"{r.status_code} {len(r.text)}B {url}")
             if r.status_code == 200:
@@ -281,14 +287,15 @@ def sa_get(session, url, log=None):
                 return BeautifulSoup(r.text, "lxml")
             if r.status_code == 404:
                 return None
-            if r.status_code in (403, 429, 503):
-                time.sleep(5 * attempt)       # blocked / rate-limited: back off
-                continue
-            return None
+            # 429 / 403 / 5xx: wait longer each time, then retry
+            time.sleep(20 * attempt)
         except requests.RequestException as ex:
+            last = "EXC"
             if log is not None:
                 log.append(f"EXC {str(ex)[:80]} {url}")
-            time.sleep(2 * attempt)
+            time.sleep(5 * attempt)
+    if log is not None:
+        log.append(f"BLOCKED ({last}) {url}")
     return None
 
 
@@ -550,7 +557,8 @@ def enrich_from_stockanalysis(symbol, result):
     # 1) dividends (page is cheap and has the whole history)
     div_soup = sa_get(s, f"{SA_BASE}/{symbol}/dividend/", log)
     result["dividends"] = parse_dividends(div_soup, fye_month)
-    if div_soup is not None and not result["dividends"]["history"]:
+    if (div_soup is not None and not result["dividends"]["history"]
+            and "Cash Amount" in div_soup.get_text(" ")):
         dbg = f"debug_{symbol}_dividend.html"
         with open(dbg, "w", encoding="utf-8") as f:
             f.write(str(div_soup))
@@ -565,6 +573,10 @@ def enrich_from_stockanalysis(symbol, result):
         base = f"{SA_BASE}/{symbol}/financials/" + (page + "/" if page else "")
         result[key] = parse_sa_financial_table(sa_get(s, base, log))
         result[key + "_quarterly"] = parse_sa_financial_table(sa_get(s, base + "?p=quarterly", log))
+
+    result["incomplete"] = any(l.startswith("BLOCKED") for l in log)
+    if not result["incomplete"] and result["dividends"]["history"]:
+        result.pop("sa_debug", None)      # keep the JSON small when all went fine
 
     # 4) Yahoo fallback for any empty ANNUAL statement
     core = ("income_statement", "balance_sheet", "cash_flow")
@@ -703,7 +715,7 @@ def main():
         with open(OUTPUT_JSON, encoding="utf-8") as f:
             for r in json.load(f).get("stocks", []):
                 # re-scrape old records that have no dividend data (made by v1)
-                if not r.get("error") and "dividends" in r:
+                if not r.get("error") and "dividends" in r and not r.get("incomplete"):
                     results[r["symbol"]] = r
         print(f"Resuming: {len(results)} already done.")
 
@@ -718,6 +730,8 @@ def main():
                 results[res["symbol"]] = res
                 n_div = len((res.get("dividends") or {}).get("history", []))
                 status = "OK" if not res["error"] else f"ERR -> {res['error']}"
+                if res.get("incomplete"):
+                    status += "  [INCOMPLETE - rate limited, will retry on --resume]"
                 print(f"[{i:3d}/{len(todo)}] {res['symbol']:10s} {status}  (dividends: {n_div})")
                 if n_div == 0 and res.get("sa_debug"):
                     for line in res["sa_debug"][:6]:
