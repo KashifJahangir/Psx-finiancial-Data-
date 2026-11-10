@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       symbols:
-        description: "Symbols to scrape, space separated (leave empty = ALL)"
-        required: false
-        default: "HUBC"
+        description: "ALL = every stock, or symbols separated by spaces (e.g. HUBC ENGRO)"
+        required: true
+        default: "ALL"
   schedule:
     - cron: "0 3 1 * *"   # 1st of every month, 03:00 UTC
 
@@ -28,11 +28,16 @@ jobs:
         run: pip install requests beautifulsoup4 lxml yfinance
 
       - name: Run scraper
+        env:
+          SYMBOLS: ${{ github.event.inputs.symbols }}
         run: |
-          if [ -z "${{ github.event.inputs.symbols }}" ]; then
+          echo "Symbols input: '$SYMBOLS'"
+          if [ -z "$SYMBOLS" ] || [ "$SYMBOLS" = "ALL" ] || [ "$SYMBOLS" = "all" ]; then
+            echo "Running ALL stocks"
             python scrape_psx_all.py --resume
           else
-            python scrape_psx_all.py --resume --symbols ${{ github.event.inputs.symbols }}
+            echo "Running only: $SYMBOLS"
+            python scrape_psx_all.py --resume --symbols $SYMBOLS
           fi
 
       - name: Commit results
@@ -42,4 +47,5 @@ jobs:
           git config user.email "actions@github.com"
           git add PSX_All_Fundamentals.json debug_*.html || true
           git commit -m "Update PSX fundamentals $(date +%Y-%m-%d)" || echo "nothing to commit"
+          git pull --rebase || true
           git push || true
