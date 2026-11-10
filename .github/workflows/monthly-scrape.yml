@@ -28,6 +28,7 @@ jobs:
         run: pip install requests beautifulsoup4 lxml yfinance
 
       - name: Run scraper
+        timeout-minutes: 320
         env:
           SYMBOLS: ${{ github.event.inputs.symbols }}
         run: |
@@ -45,7 +46,8 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add PSX_All_Fundamentals.json debug_*.html || true
+          git add PSX_All_Fundamentals.json
+          git add debug_*.html 2>/dev/null || true
           git commit -m "Update PSX fundamentals $(date +%Y-%m-%d)" || echo "nothing to commit"
           git pull --rebase || true
-          git push || true
+          git push
