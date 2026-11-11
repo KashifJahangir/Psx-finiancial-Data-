@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """
-PSX Fundamental Scraper -> JSON   (v2: stockanalysis-first)
+PSX Fundamental Scraper -> JSON   (v4: v3 data + units map)
 
-Per company it collects:
-  PSX (dps.psx.com.pk):
-      market cap, shares, free float, 52-week range, fiscal year end,
-      business description, key people, annual/quarterly Sales/PAT/EPS
-  stockanalysis.com (https://stockanalysis.com/quote/psx/<SYMBOL>/...):
-      * dividend page   -> summary + FULL dividend history + DPS per fiscal year
-      * statistics page -> every valuation / margin / ratio label->value pair
-      * company page    -> sector, industry, employees, website, etc.
-      * income statement, balance sheet, cash flow, ratios
-        (annual AND quarterly, values in millions PKR)
-
-Then, per fiscal year in "annual", it adds DPS, Dividend_Yield, Payout_Ratio.
+What v4 adds
+------------
+* Every metric scraped from stockanalysis now has a unit recorded in a
+  separate "units" map (the value structure is unchanged, so existing app
+  code keeps working):
+      PKR_million     money rows (Revenue, Net Income, Total Assets ...)
+      percent         rows ending in "Growth", margins, yields, payout ...
+      PKR_per_share   EPS, DPS, book value per share ...
+      million_shares  share counts
+      ratio / multiple / days / date
+* "units_note" explains the PSX-page vs stockanalysis units.
+* SCHEMA_VERSION = 4, so --resume re-scrapes anything made by v3.
 
 Usage:
-  python psx_scraper.py --symbols ENGRO        # ALWAYS test one stock first
+  python psx_scraper.py --symbols HUBC        # ALWAYS test one stock first
   python psx_scraper.py --resume
-  python psx_scraper.py --no-statements        # PSX page only (fast)
+  python psx_scraper.py --no-statements       # PSX page only (fast)
 """
 
 import argparse
@@ -43,12 +43,14 @@ except ImportError:
 # ------------------------------------------------------------------
 INPUT_JSON = "psx_all_stocks.json"
 OUTPUT_JSON = "PSX_All_Fundamentals.json"
+SCHEMA_VERSION = 4
 MAX_WORKERS = 2            # stockanalysis rate-limits; keep this low
 REQUEST_DELAY = 0.8
 SA_DELAY = 1.2             # pause between stockanalysis requests
 TIMEOUT = 30
 RETRIES = 3
 SAVE_EVERY = 25
+MIN_STATEMENT_ROWS = 10    # fewer rows than this -> save raw HTML for debugging
 
 SA_BASE = "https://stockanalysis.com/quote/psx"
 
@@ -59,16 +61,26 @@ HEADERS = {
 }
 
 # output key -> stockanalysis path under /financials/
+# (each one is fetched twice: annual and ?p=quarterly)
 STATEMENT_PAGES = {
-    "income_statement": "",
+    "income_statement": "income-statement",
     "balance_sheet": "balance-sheet",
     "cash_flow": "cash-flow-statement",
     "ratios": "ratios",
+    "kpis": "metrics",     # not every stock has it; a 404 is simply ignored
 }
+# the pages that must be non-empty, otherwise Yahoo is used as a fallback
+CORE_STATEMENTS = ("income_statement", "balance_sheet", "cash_flow")
+
+UNITS_NOTE = ("stockanalysis statements: PKR millions unless the units map says "
+              "percent / PKR_per_share / million_shares / ratio / multiple / days / date. "
+              "PSX-page 'annual'/'quarterly' Sales & PAT: PKR thousands.")
 
 NUM_RE = re.compile(r"^[\d,]+(?:\.\d+)?$")
 YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 QUARTER_RE = re.compile(r"\bQ[1-4]\b", re.I)
+DATE_IN_TEXT_RE = re.compile(r"[A-Z][a-z]{2,8} \d{1,2}, \d{4}")
+DASHES = ("", "-", "—", "–", "N/A", "n/a", "NA", "Upgrade")
 
 MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun",
@@ -95,11 +107,11 @@ def norm(s):
 
 def clean_number(text):
     text = norm(str(text) if text is not None else "")
-    if text in ("", "-", "—", "–", "N/A", "n/a", "NA", "Upgrade"):
+    if text in DASHES:
         return None
     neg = (text.startswith("(") and text.endswith(")")) or text.startswith("-")
     text = (text.replace(",", "").replace("(", "").replace(")", "")
-            .replace("%", "").replace("-", "").strip())
+            .replace("%", "").replace("-", "").rstrip("xX").strip())
     try:
         val = float(text)
     except ValueError:
@@ -109,6 +121,29 @@ def clean_number(text):
 
 def snake(label):
     return re.sub(r"[^A-Za-z0-9]+", "_", norm(label)).strip("_")
+
+
+def infer_unit(label, raw=""):
+    """Unit of one stockanalysis row. The cell text wins (%, x); the label is the fallback."""
+    raw, lab = norm(raw), norm(label).lower()
+    if lab.startswith("period ending"):
+        return "date"
+    if raw.endswith("%"):
+        return "percent"
+    if re.search(r"\d\s*[xX]$", raw):
+        return "multiple"
+    if (lab.endswith("growth") or "margin" in lab or "yield" in lab
+            or "payout" in lab or "return on" in lab or lab.endswith(" rate")):
+        return "percent"
+    if re.search(r"per share|\beps\b|\bdps\b|last close price", lab):
+        return "PKR_per_share"
+    if "shares" in lab:
+        return "million_shares"
+    if "days" in lab:
+        return "days"
+    if re.search(r"ratio|turnover|/", lab):
+        return "ratio"
+    return "PKR_million"
 
 
 def norm_period(p):
@@ -299,38 +334,102 @@ def sa_get(session, url, log=None):
     return None
 
 
-def parse_sa_financial_table(soup):
-    """First data table on a /financials/ page -> {period: {metric: value}}."""
-    if soup is None:
-        return {}
-    tbl = soup.find("table")
-    if not tbl:
-        return {}
-    rows = tbl.find_all("tr")
-    if len(rows) < 3:
-        return {}
-    header = [norm(c.get_text(" ", strip=True)) for c in rows[0].find_all(["th", "td"])]
+def _cells(tr):
+    """Direct <th>/<td> children only (so nested markup can't shift columns)."""
+    return tr.find_all(["th", "td"], recursive=False)
+
+
+def _label(cell):
+    """Row label = first non-empty text chunk of the first cell. Avoids the
+    'Revenue Revenue Growth' style merged labels from hidden/nested spans."""
+    for s in cell.stripped_strings:
+        s = norm(s)
+        if s:
+            return s
+    return ""
+
+
+def _is_period_header(cells):
+    vals = [norm(c.get_text(" ", strip=True)) for c in cells[1:]]
+    vals = [v for v in vals if v]
+    if not vals:
+        return False
+    return all(v.upper() == "TTM" or YEAR_RE.search(v) for v in vals)
+
+
+def parse_one_sa_table(tbl):
+    """One stockanalysis data table -> ({period: {metric: value}}, {metric: unit})."""
+    trs = tbl.find_all("tr")
+    hdr_idx = None
+    for i, tr in enumerate(trs):
+        cells = _cells(tr)
+        if len(cells) >= 2 and _is_period_header(cells):
+            hdr_idx = i
+            break
+    if hdr_idx is None:
+        return {}, {}
+
+    header = [norm(c.get_text(" ", strip=True)) for c in _cells(trs[hdr_idx])]
     periods = [norm_period(p) for p in header[1:]]
     out = {p: {} for p in periods if p}
-    for row in rows[1:]:
-        cells = [norm(c.get_text(" ", strip=True)) for c in row.find_all(["th", "td"])]
+    units = {}
+    label_count = {}
+
+    for tr in trs[hdr_idx + 1:]:
+        cells = _cells(tr)
         if len(cells) < 2:
             continue
-        key = snake(cells[0])
-        if not key:
+        label = _label(cells[0])
+        base = snake(label)
+        if not base:
             continue
-        for i, p in enumerate(periods):
-            if p and i + 1 < len(cells):
-                raw = cells[i + 1]
-                is_text = key.lower().startswith(("period", "reporting"))
-                base = key
-                n = 2
-                while key in out[p]:            # duplicate labels
-                    key = f"{base}_{n}"
+        label_count[base] = label_count.get(base, 0) + 1
+        key = base if label_count[base] == 1 else f"{base}_{label_count[base]}"
+
+        vals = cells[1:]
+        if len(vals) > len(periods):               # extra leading columns -> align right
+            vals = vals[-len(periods):]
+        sample = ""                                # first non-empty raw cell decides the unit
+        for p, cell in zip(periods, vals):
+            if not p:
+                continue
+            raw = norm(cell.get_text(" ", strip=True))
+            if not sample and raw not in DASHES:
+                sample = raw
+            if key.lower().startswith("period_ending"):
+                m = DATE_IN_TEXT_RE.search(raw)
+                out[p][key] = m.group(0) if m else raw
+                continue
+            num = clean_number(raw)
+            if num is not None:
+                out[p][key] = num
+            elif raw in DASHES:
+                out[p][key] = None
+            else:
+                out[p][key] = raw                  # keep text values instead of losing them
+        units[key] = infer_unit(label, sample)
+    return out, units
+
+
+def parse_sa_financial_table(soup):
+    """ALL tables on a /financials/ page (main table + 'Additional Metrics' ...)
+    merged into ({period: {metric: value}}, {metric: unit})."""
+    if soup is None:
+        return {}, {}
+    merged, units = {}, {}
+    for tbl in soup.find_all("table"):
+        data, u = parse_one_sa_table(tbl)
+        for period, metrics in data.items():
+            tgt = merged.setdefault(period, {})
+            for k, v in metrics.items():
+                kk, n = k, 2
+                while kk in tgt:                   # same label in a later table
+                    kk = f"{k}_{n}"
                     n += 1
-                out[p][key] = raw if is_text else clean_number(raw)
-                key = base
-    return out
+                tgt[kk] = v
+                if k in u:
+                    units.setdefault(kk, u[k])
+    return merged, units
 
 
 def parse_label_value_pairs(soup):
@@ -355,6 +454,10 @@ def parse_sa_company(soup):
             if p:
                 out["Company Description"] = norm(p.get_text(" ", strip=True))
     return out
+
+
+def count_rows(statement):
+    return max((len(v) for v in statement.values()), default=0)
 
 
 # ------------------------------------------------------------------
@@ -433,6 +536,12 @@ def extract_dividend_rows(soup):
     return rows_out
 
 
+def clean_text_block(t):
+    for ch in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212", "\xa0"):
+        t = t.replace(ch, "-" if ch != "\xa0" else " ")
+    return t
+
+
 def parse_dividends(soup, fye_month):
     out = {"summary": {}, "history": [], "by_fiscal_year": {}, "by_calendar_year": {}}
     if soup is None:
@@ -474,12 +583,6 @@ def parse_dividends(soup, fye_month):
     return out
 
 
-def clean_text_block(t):
-    for ch in ("\u2010", "\u2011", "\u2012", "\u2013", "\u2014", "\u2212", "\xa0"):
-        t = t.replace(ch, "-" if ch != "\xa0" else " ")
-    return t
-
-
 def apply_dividends_to_annual(result):
     """Put DPS / Dividend_Yield / Payout_Ratio into each year of result['annual']."""
     div = result.get("dividends") or {}
@@ -502,14 +605,14 @@ def apply_dividends_to_annual(result):
         sa_yield = r.get("Dividend_Yield")
         sa_payout = r.get("Payout_Ratio")
 
-        if sa_yield is not None:
+        if isinstance(sa_yield, (int, float)):
             ann["Dividend_Yield"] = sa_yield
         else:
             ann["Dividend_Yield"] = round(dps / price * 100.0, 2) if price else None
             ann["Dividend_Yield_basis"] = "current_price"
 
         eps = ann.get("EPS")
-        if sa_payout is not None:
+        if isinstance(sa_payout, (int, float)):
             ann["Payout_Ratio"] = sa_payout
         elif eps is not None and eps > 0:
             ann["Payout_Ratio"] = round(dps / eps * 100.0, 2)
@@ -549,6 +652,27 @@ def fetch_statements_yahoo(symbol):
 # ------------------------------------------------------------------
 # Everything from stockanalysis for one symbol
 # ------------------------------------------------------------------
+def save_debug_html(symbol, name, soup, log, why):
+    fn = f"debug_{symbol}_{name}.html"
+    try:
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(str(soup))
+        log.append(f"{why} - raw page saved to {fn}")
+    except OSError:
+        pass
+
+
+def fetch_statement(session, symbol, key, url, log):
+    """-> (data, units)"""
+    soup = sa_get(session, url, log)
+    data, units = parse_sa_financial_table(soup)
+    if (soup is not None and key in CORE_STATEMENTS
+            and count_rows(data) < MIN_STATEMENT_ROWS and "?p=" not in url):
+        save_debug_html(symbol, key, soup, log,
+                        f"{key}: only {count_rows(data)} rows parsed")
+    return data, units
+
+
 def enrich_from_stockanalysis(symbol, result):
     s = requests.Session()
     log = result.setdefault("sa_debug", [])
@@ -559,30 +683,29 @@ def enrich_from_stockanalysis(symbol, result):
     result["dividends"] = parse_dividends(div_soup, fye_month)
     if (div_soup is not None and not result["dividends"]["history"]
             and "Cash Amount" in div_soup.get_text(" ")):
-        dbg = f"debug_{symbol}_dividend.html"
-        with open(dbg, "w", encoding="utf-8") as f:
-            f.write(str(div_soup))
-        log.append(f"no dividend rows parsed - raw page saved to {dbg}")
+        save_debug_html(symbol, "dividend", div_soup, log, "no dividend rows parsed")
 
     # 2) statistics + company page
     result["statistics"] = parse_label_value_pairs(sa_get(s, f"{SA_BASE}/{symbol}/statistics/", log))
     result["sa_company"] = parse_sa_company(sa_get(s, f"{SA_BASE}/{symbol}/company/", log))
 
-    # 3) statements + ratios, annual and quarterly
+    # 3) statements + ratios + KPIs, annual and quarterly
     for key, page in STATEMENT_PAGES.items():
         base = f"{SA_BASE}/{symbol}/financials/" + (page + "/" if page else "")
-        result[key] = parse_sa_financial_table(sa_get(s, base, log))
-        result[key + "_quarterly"] = parse_sa_financial_table(sa_get(s, base + "?p=quarterly", log))
+        result[key], u1 = fetch_statement(s, symbol, key, base, log)
+        result[key + "_quarterly"], u2 = fetch_statement(s, symbol, key, base + "?p=quarterly", log)
+        result["units"][key] = {**u2, **u1}      # same units for annual + quarterly
 
     result["incomplete"] = any(l.startswith("BLOCKED") for l in log)
-    if not result["incomplete"] and result["dividends"]["history"]:
+    healthy = (not result["incomplete"] and result["dividends"]["history"]
+               and count_rows(result.get("income_statement", {})) >= MIN_STATEMENT_ROWS)
+    if healthy:
         result.pop("sa_debug", None)      # keep the JSON small when all went fine
 
     # 4) Yahoo fallback for any empty ANNUAL statement
-    core = ("income_statement", "balance_sheet", "cash_flow")
-    if not all(result.get(k) for k in core):
+    if not all(result.get(k) for k in CORE_STATEMENTS):
         yb = fetch_statements_yahoo(symbol)
-        for k in core:
+        for k in CORE_STATEMENTS:
             if not result.get(k) and yb.get(k):
                 result[k] = yb[k]
                 result.setdefault("statement_source", {})[k] = "yahoo"
@@ -606,6 +729,7 @@ def scrape_one(stock, with_statements=True):
     symbol, name = stock["symbol"], stock["name"]
     url = f"https://dps.psx.com.pk/company/{symbol}"
     result = {
+        "schema_version": SCHEMA_VERSION,
         "symbol": symbol, "name": name, "url": url,
         "in_kse100": stock.get("in_kse100", False),
         "market_cap_000s": None, "total_shares": None,
@@ -615,9 +739,11 @@ def scrape_one(stock, with_statements=True):
         "annual": {}, "quarterly": {},
         "current_price_implied": None,
         "dividends": {}, "statistics": {}, "sa_company": {},
-        "income_statement": {}, "balance_sheet": {}, "cash_flow": {}, "ratios": {},
+        "income_statement": {}, "balance_sheet": {}, "cash_flow": {}, "ratios": {}, "kpis": {},
         "income_statement_quarterly": {}, "balance_sheet_quarterly": {},
-        "cash_flow_quarterly": {}, "ratios_quarterly": {},
+        "cash_flow_quarterly": {}, "ratios_quarterly": {}, "kpis_quarterly": {},
+        "units": {},
+        "units_note": UNITS_NOTE,
         "error": None,
     }
     last_err = None
@@ -674,6 +800,7 @@ def save(results, order, total):
     product = {
         "index": "PSX-ALL",
         "source": "PSX Data Portal (dps.psx.com.pk) + stockanalysis.com / Yahoo Finance",
+        "schema_version": SCHEMA_VERSION,
         "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "count": len(results_sorted),
         "target_count": total,
@@ -714,8 +841,10 @@ def main():
     if args.resume and os.path.exists(OUTPUT_JSON):
         with open(OUTPUT_JSON, encoding="utf-8") as f:
             for r in json.load(f).get("stocks", []):
-                # re-scrape old records that have no dividend data (made by v1)
-                if not r.get("error") and "dividends" in r and not r.get("incomplete"):
+                # keep only complete records made by THIS schema version;
+                # anything older (v2/v3, no units map) is re-scraped
+                if (r.get("schema_version") == SCHEMA_VERSION and not r.get("error")
+                        and "dividends" in r and not r.get("incomplete")):
                     results[r["symbol"]] = r
         print(f"Resuming: {len(results)} already done.")
 
@@ -729,12 +858,16 @@ def main():
                 res = fut.result()
                 results[res["symbol"]] = res
                 n_div = len((res.get("dividends") or {}).get("history", []))
+                n_is = count_rows(res.get("income_statement", {}))
+                n_bs = count_rows(res.get("balance_sheet", {}))
+                n_cf = count_rows(res.get("cash_flow", {}))
                 status = "OK" if not res["error"] else f"ERR -> {res['error']}"
                 if res.get("incomplete"):
                     status += "  [INCOMPLETE - rate limited, will retry on --resume]"
-                print(f"[{i:3d}/{len(todo)}] {res['symbol']:10s} {status}  (dividends: {n_div})")
-                if n_div == 0 and res.get("sa_debug"):
-                    for line in res["sa_debug"][:6]:
+                print(f"[{i:3d}/{len(todo)}] {res['symbol']:10s} {status}  "
+                      f"(dividends: {n_div}, rows IS/BS/CF: {n_is}/{n_bs}/{n_cf})")
+                if res.get("sa_debug") and (n_div == 0 or n_is < MIN_STATEMENT_ROWS):
+                    for line in res["sa_debug"][:8]:
                         print("      ", line)
                 if i % SAVE_EVERY == 0:
                     save(results, order, len(stocks))
